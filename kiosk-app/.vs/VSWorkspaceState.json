@@ -1,0 +1,14 @@
+{
+  "ExpandedNodes": [
+    "",
+    "\\env",
+    "\\smart-kiosk",
+    "\\smart-kiosk\\bridges",
+    "\\smart-kiosk\\core",
+    "\\smart-kiosk\\models",
+    "\\smart-kiosk\\ui",
+    "\\smart-kiosk\\vision"
+  ],
+  "SelectedNode": "\\smart-kiosk\\main.py",
+  "PreviewInSolutionExplorer": false
+}
