@@ -73,14 +73,28 @@
     int           eyeDirection     = 0;
     String        currentSysDate   = "--/--/----";
 
-    // === DOOR LOCK: biến kiểm soát chu kỳ mở cửa ===
-    volatile bool doorLocked   = false;   // true = đang trong 10s mở cửa, bỏ qua quét mới
-    unsigned long doorOpenTime = 0;       // millis() lúc mở cửa
+    // === KHÓA CỬA: biến kiểm soát chu kỳ mở cửa ===
+    volatile bool doorLocked   = false;   // true = đang trong 10 giây mở cửa, bỏ qua quét mới
+    unsigned long doorOpenTime = 0;       // thời điểm mở cửa
     #define DOOR_OPEN_DURATION  10000     // 10 giây
 
+    // === MỚI: KHÓA PHIÊN DÙNG CHUNG GIỮA RFID VÀ NHẬN DIỆN KHUÔN MẶT ===
+    // "" = không bên nào đang xử lý | "RFID" = đang quẹt thẻ | "FACE" = đang nhận diện khuôn mặt
+    String        sessionLock          = "";
+    unsigned long lastSessionLockPoll  = 0;
+    #define SESSION_LOCK_POLL_INTERVAL 600   // đọc khóa từ Firebase mỗi 600ms
+    bool          rfidBusyNoticeShown  = false;  // chỉ báo 1 lần khi bị khóa bởi nhận diện khuôn mặt
+
     bool          hasAdmin           = false;
+    unsigned long lastActionTime      = 0;
     unsigned long lastAdminRefresh   = 0;
     #define ADMIN_REFRESH_INTERVAL   60000
+
+    // === TELEMETRY ===
+    unsigned long rfidScanStart   = 0;
+    float         rfidResponseS   = 0.0;
+    unsigned long lastTelemetry   = 0;
+    #define TELEMETRY_INTERVAL 5000
 
     TaskHandle_t TaskAudioHandle;
     TaskHandle_t TaskSensorsHandle;
@@ -106,7 +120,7 @@
     void firebaseSetString(const char* path, const char* value);
 
     // ============================================================
-    //  UTILS
+    //  TIỆN ÍCH
     // ============================================================
     String removeAccents(String text) {
         String r = text;
@@ -159,20 +173,50 @@
             val.trim(); val.toLowerCase();
             hasAdmin = (val == "true" || val == "1");
             lastAdminRefresh = now;
-            Serial.printf("[Firebase] Admin=%s\n", hasAdmin ? "true" : "false");
+            Serial.printf("Trang thai Admin: %s\n", hasAdmin ? "da co" : "chua co");
         }
     }
 
-  
-    * @param name        Tên người được xác thực
-    * @param speechText  Văn bản TTS
-    * @param logPath     Path Firebase để push log (có thể "")
-    * @param logEntry    Con trỏ FirebaseJson log (NULL nếu không cần)
-    */
+    // === MỚI: Đọc khóa phiên từ Firebase (xem module nhận diện khuôn mặt có đang giữ khóa không) ===
+    void pollSessionLock() {
+        unsigned long now = millis();
+        if (now - lastSessionLockPoll < SESSION_LOCK_POLL_INTERVAL) return;
+        lastSessionLockPoll = now;
+        if (!Firebase.ready()) return;
+        if (Firebase.RTDB.getString(&fbdo_sensor, "/RobotLeTan/SessionLock")) {
+            String val = fbdo_sensor.stringData();
+            val.trim();
+            if (val != sessionLock) {
+                sessionLock = val;
+                // Bị khóa bởi module nhận diện khuôn mặt -> báo 1 lần duy nhất, không lặp lại
+                if (sessionLock == "FACE" && !rfidBusyNoticeShown) {
+                    rfidBusyNoticeShown = true;
+                    triggerEmotion(3, "DANG NHAN DIEN KHUON MAT", "Hệ thống đang bận, vui lòng chờ.");
+                }
+                if (sessionLock == "") {
+                    rfidBusyNoticeShown = false;  // reset để lần khóa sau vẫn báo được
+                }
+            }
+        }
+    }
+
+    // === MỚI: Đầu đọc thẻ tự giữ khóa phiên khi bắt đầu xử lý 1 thẻ hợp lệ ===
+    void acquireSessionLock() {
+        sessionLock = "RFID";
+        firebaseSetString("/RobotLeTan/SessionLock", "RFID");
+    }
+
+    // === MỚI: Giải khóa khi xử lý xong (mở cửa thành công hoặc từ chối) ===
+    void releaseSessionLock() {
+        sessionLock = "";
+        firebaseSetString("/RobotLeTan/SessionLock", "");
+    }
+
+
     void openDoorAndLock(String name, String speechText, String logPath, FirebaseJson* logEntry) {
-        // Nếu đang trong chu kỳ mở → bỏ qua hoàn toàn
+        // Nếu đang trong chu kỳ mở thì bỏ qua hoàn toàn
         if (doorLocked) {
-            Serial.println("[DOOR] Đang trong chu kỳ mở cửa, bỏ qua lệnh mới.");
+            Serial.println("Đang trong chu kỳ mở cửa, bỏ qua lệnh mới.");
             return;
         }
 
@@ -181,9 +225,9 @@
         doorLocked   = true;
         doorOpenTime = millis();
 
-        Serial.printf("[DOOR] Mở cửa cho: %s — Khóa 10 giây.\n", name.c_str());
+        Serial.printf("Mở cửa cho: %s, khóa trong 10 giây.\n", name.c_str());
 
-        // Hiển thị & phát âm
+        // Hiển thị và phát âm
         triggerEmotion(1, name, speechText);
 
         // Ghi log Firebase (tuỳ chọn)
@@ -196,7 +240,7 @@
     }
 
     // ============================================================
-    //  FIREBASE TASK
+    //  TASK FIREBASE
     // ============================================================
     void TaskFirebaseCode(void* pvParameters) {
         FirebaseSyncRequest req;
@@ -231,15 +275,16 @@
     }
 
     // ============================================================
-    //  ENROLLMENT
+    //  ĐĂNG KÝ THẺ QUẢN TRỊ VIÊN
     // ============================================================
     void executeEnrollment(int id) {
-        triggerEmotion(3, "DANG KY ADMIN", "Vui lòng quẹt thẻ từ để thiết lập Quản trị viên");
+        triggerEmotion(3, "DANG KY ADMIN", "Vui lòng quẹt thẻ để thiết lập Quản trị viên");
         unsigned long waitTime = millis();
         bool cardLinked = false;
         while (millis() - waitTime < 15000) {
             esp_task_wdt_reset();
             if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+                rfidScanStart = millis();
                 String uid = getUID();
                 mfrc522.PICC_HaltA();
                 prefs.putInt(uid.c_str(), id);
@@ -257,7 +302,7 @@
     }
 
     // ============================================================
-    //  TASK SENSORS — Core 1
+    //  TASK CẢM BIẾN — Core 1
     // ============================================================
     void TaskSensorsCode(void* pvParameters) {
         esp_task_wdt_add(NULL);
@@ -276,17 +321,17 @@
             refreshAdminStatus(false);
 
             // ============================================================
-            //  XỬ LÝ QUEUE LỆNH (từ Web / Python AI / Firebase Stream)
+            //  XỬ LÝ HÀNG ĐỢI LỆNH (từ Web Admin / Module nhận diện khuôn mặt / Firebase Stream)
             // ============================================================
             while (xQueueReceive(cmdQueue, &cmd, 0) == pdTRUE) {
                 String command = String(cmd.command);
 
-                // ---- Các lệnh quản trị không bị ảnh hưởng bởi doorLocked ----
+                // ---- Các lệnh quản trị không bị ảnh hưởng bởi trạng thái khóa cửa ----
                 if (command == "FORCE_SAVE_RFID") {
                     String rfid = String(cmd.rfid); rfid.trim();
                     if (rfid != "") {
                         prefs.putInt(rfid.c_str(), cmd.targetID);
-                        Serial.printf("[RFID] Lưu thẻ %s → ID %d\n", rfid.c_str(), cmd.targetID);
+                        Serial.printf("Lưu thẻ %s vào ID %d\n", rfid.c_str(), cmd.targetID);
                         triggerEmotion(1, "DA LUU THE MOI", "Đồng bộ thẻ thành công!");
                     }
                 }
@@ -315,7 +360,7 @@
                     if (!ok) triggerEmotion(2, "SAI QUYEN", "Từ chối mở khóa.");
                 }
                 else if (command == "CHANGE_ADMIN") {
-                    triggerEmotion(2, "DOI ADMIN", "Quẹt thẻ Admin CŨ để xác nhận.");
+                    triggerEmotion(2, "DOI ADMIN", "Quẹt thẻ Admin cũ để xác nhận.");
                     unsigned long t = millis(); bool ok = false;
                     while (millis() - t < 10000) {
                         esp_task_wdt_reset();
@@ -349,34 +394,34 @@
                     } else triggerEmotion(3, "HET GIO", "Hủy thao tác xóa.");
                 }
 
-                // ---- Lệnh từ Python AI (face pipeline) ----
+                // ---- Lệnh từ module nhận diện khuôn mặt ----
                 else if (command == "START_REGISTER") {
                     String regName = String(cmd.name);
-                    triggerEmotion(3, "DANG KY MAT", "Bắt đầu đăng ký khuôn mặt cho " + regName + ". Nhìn thẳng vào camera.");
+                    triggerEmotion(2, "DANG KY KHUON MAT",
+                        "Bắt đầu đăng ký khuôn mặt cho " + regName + ". Nhìn thẳng vào camera.");
                 }
                 else if (command == "CHALLENGE_STEP") {
-                    String s = String(cmd.step);
-                    if      (s == "PASSIVE")    triggerEmotion(3, "DANG KIEM TRA",  "Hệ thống đang xác thực.");
-                    else if (s == "BLINK")      triggerEmotion(3, "NHAY MAT 1 LAN", "Vui lòng nháy mắt.");
-                    else if (s == "TURN_LEFT")  triggerEmotion(3, "QUAY TRAI",      "Vui lòng quay mặt sang trái.");
-                    else if (s == "TURN_RIGHT") triggerEmotion(3, "QUAY PHAI",      "Vui lòng quay mặt sang phải.");
-                    else if (s == "RECOGNIZE")  triggerEmotion(3, "DANG NHAN DIEN", "Đang nhận diện khuôn mặt.");
+                      String s = String(cmd.step);
+                    if      (s == "PASSIVE")    triggerEmotion(3, "DANG KIEM TRA",  "");  // ← xóa câu nói
+                    else if (s == "BLINK")      triggerEmotion(3, "NHAY MAT 1 LAN", "");
+                    else if (s == "TURN_LEFT")  triggerEmotion(3, "QUAY TRAI",      "");
+                    else if (s == "TURN_RIGHT") triggerEmotion(3, "QUAY PHAI",      "");
+                    else if (s == "RECOGNIZE")  triggerEmotion(3, "DANG NHAN DIEN", "");
                     else if (s == "IDLE")       { isWaiting = true; drawChillEyes(); }
                 }
                 else if (command == "FACE_UNKNOWN") {
-                    // Chỉ hiển thị nếu cửa đang đóng (tránh flicker trong chu kỳ mở)
+                    // Chỉ hiển thị nếu cửa đang đóng, tránh giật hình trong chu kỳ mở
                     if (!doorLocked)
                         triggerEmotion(2, "KHONG NHAN RA", "Khuôn mặt không có trong hệ thống.");
                 }
                 else if (command == "SPOOF_ALERT") {
                     if (!doorLocked)
-                        triggerEmotion(2, "PHAT HIEN GIAN LAN", "Phát hiện hành vi giả mạo. Từ chối truy cập.");
+                        triggerEmotion(2, "PHAT HIEN GIAN LAN", "Từ chối truy cập.");
                 }
-                // ---- FACE_RECOGNIZED: dùng openDoorAndLock ----
+                // ---- FACE_RECOGNIZED: dùng chung hàm mở cửa với RFID ----
                 else if (command == "FACE_RECOGNIZED") {
                     String recognizedName = String(cmd.name);
-                    String speech = "Xin chao " + recognizedName + ". Chuc ban mot ngay tot lanh.";
-                    openDoorAndLock(recognizedName, speech, "", nullptr);
+                    if (recognizedName == "") recognizedName = "Khach";
 
                     // Lấy thời gian cho log
                     struct tm st; String todayStr = "Unknown", timeStr = "00:00:00";
@@ -390,12 +435,13 @@
                     faceLog.add("time",   timeStr);
                     String facePath = "/DailyLogs/" + todayStr;
 
-                    openDoorAndLock(recognizedName, speech, facePath, &faceLog);
+                    String speechStr = "Xin chao " + recognizedName + "Chúc bạn một ngày tốt lành.";
+                    openDoorAndLock(recognizedName, speechStr, facePath, &faceLog);
                 }
             }
 
             // ============================================================
-            //  KIỂM TRA ĐÓNG CỬA SAU 10 GIÂY (thay thế logic 5s cũ)
+            //  KIỂM TRA ĐÓNG CỬA SAU 10 GIÂY
             // ============================================================
             if (doorLocked && (millis() - doorOpenTime >= DOOR_OPEN_DURATION)) {
                 myServo.write(0);           // Đóng cửa
@@ -404,13 +450,21 @@
                 eyeDirection = 0;
                 drawChillEyes();
                 firebaseSetString("/RobotLeTan/Status", "READY");
-                Serial.println("[DOOR] Đóng cửa sau 10 giây — Sẵn sàng quét tiếp.");
+                releaseSessionLock();       // MỚI: phiên xác thực đã xong, giải khóa cho luồng còn lại hoạt động
+                Serial.println("Đóng cửa sau 10 giây, sẵn sàng quét tiếp.");
             }
 
             // ============================================================
-            //  RFID SCAN — chỉ xử lý khi cửa đang đóng (doorLocked == false)
+            //  MỚI: Đồng bộ khóa phiên (chặn quét thẻ nếu nhận diện khuôn mặt đang xử lý)
             // ============================================================
-            if (!doorLocked && mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+            pollSessionLock();
+
+            // ============================================================
+            //  QUÉT THẺ RFID — chỉ xử lý khi cửa đang đóng và không bị khóa
+            // ============================================================
+            if (!doorLocked && sessionLock != "FACE"
+                && mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+                rfidScanStart = millis();
                 String uid = getUID();
                 mfrc522.PICC_HaltA();
 
@@ -423,10 +477,14 @@
 
                 int id = prefs.getInt(uid.c_str(), -1);
 
+                // MỚI: giữ khóa phiên ngay khi bắt đầu xử lý thẻ, trước khi xác định hợp lệ hay không
+                acquireSessionLock();
+
                 if (!hasAdmin) {
                     triggerEmotion(2, "HE THONG TRONG", "Chưa cấu hình Quản trị viên.");
                     FirebaseJson j; j.add("rfid", uid); j.add("time", timeStr);
                     firebasePushJSON("/RobotLeTan/UnregisteredCards", j.raw());
+                    releaseSessionLock();   // MỚI: không có gì để chờ, giải khóa ngay
                 }
                 else if (id != -1) {
                     // Lấy tên từ Firebase
@@ -446,20 +504,38 @@
                     String logPath = "/DailyLogs/" + todayStr;
 
                     openDoorAndLock(name, speech, logPath, &logEntry);
+                    rfidResponseS = (millis() - rfidScanStart) / 1000.0;
+                    Serial.printf("[TELEMETRY] RFID Response: %.2f s\n", rfidResponseS);
+                    // Lưu ý: khóa phiên được giải phóng khi cửa đóng lại (xem khối kiểm tra đóng cửa bên trên)
                 }
                 else {
-                    // Thẻ lạ — không mở cửa, không lock
+                    // Thẻ lạ, không mở cửa, nhưng vẫn cần giải khóa phiên
                     triggerEmotion(3, "THE KHONG HOP LE", "Thẻ chưa được cấp phép.");
                     FirebaseJson j; j.add("rfid", uid); j.add("time", timeStr);
                     firebasePushJSON("/RobotLeTan/UnregisteredCards", j.raw());
+                    releaseSessionLock();   // MỚI: thẻ không hợp lệ, không mở cửa, giải khóa ngay
                 }
             }
 
-            // Mắt nhìn ngẫu nhiên khi idle (chỉ khi chờ và cửa đóng)
+            // Mắt nhìn ngẫu nhiên khi rảnh (chỉ khi chờ và cửa đóng)
             if (isWaiting && !doorLocked && random(0, 100) < 5) {
                 eyeDirection = random(0, 3);
                 drawChillEyes();
                 vTaskDelay(300 / portTICK_PERIOD_MS);
+            }
+
+            // In telemetry mỗi 5 giây
+            if (millis() - lastTelemetry >= TELEMETRY_INTERVAL) {
+                lastTelemetry = millis();
+                Serial.println("========= ESP32 TELEMETRY =========");
+                Serial.printf("Uptime       : %lu s\n",   millis() / 1000);
+                Serial.printf("Free Heap    : %u bytes\n", esp_get_free_heap_size());
+                Serial.printf("WiFi RSSI    : %d dBm\n",  WiFi.RSSI());
+                Serial.printf("RFID Last    : %.2f s\n",  rfidResponseS);
+                Serial.printf("Door Status  : %s\n",      doorLocked ? "OPEN" : "CLOSED");
+                Serial.printf("cmdQueue     : %u items\n", uxQueueMessagesWaiting(cmdQueue));
+                Serial.printf("Stack Sensor : %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
+                Serial.println("===================================");
             }
 
             vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -467,13 +543,19 @@
     }
 
     // ============================================================
-    //  TASK AUDIO
+    //  TASK ÂM THANH
     // ============================================================
     void TaskAudioCode(void* pvParameters) {
         AudioMessage audioMsg;
         for (;;) {
-            if (xQueueReceive(audioQueue, &audioMsg, pdMS_TO_TICKS(10)) == pdTRUE)
-                audio.connecttospeech(audioMsg.text, "vi");
+            // === SỬA: chỉ lấy câu MỚI ra khỏi hàng đợi khi câu HIỆN TẠI
+            // đã phát xong (audio.isRunning() == false). Trước đây cứ có
+            // message mới là gọi connecttospeech() ngay, cắt ngang câu
+            // đang nói giữa chừng -> nghe giật, nhảy liên tục, dễ lag hệ thống.
+            if (!audio.isRunning()) {
+                if (xQueueReceive(audioQueue, &audioMsg, pdMS_TO_TICKS(10)) == pdTRUE)
+                    audio.connecttospeech(audioMsg.text, "vi");
+            }
             audio.loop();
             vTaskDelay(1 / portTICK_PERIOD_MS);
         }
@@ -486,7 +568,7 @@
     }
 
     // ============================================================
-    //  LOCAL API SERVER
+    //  MÁY CHỦ API CỤC BỘ
     // ============================================================
     void setupServer() {
         DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin",  "*");
@@ -508,7 +590,7 @@
             if (doc.containsKey("step"))     strncpy(cmd.step,     doc["step"],     29);
             if (doc.containsKey("reason"))   strncpy(cmd.step,     doc["reason"],   29);
             xQueueSend(cmdQueue, &cmd, 0);
-            Serial.println("[API] Lệnh cục bộ: " + String(cmd.command));
+            Serial.println("Lệnh cục bộ: " + String(cmd.command));
             request->send(200, "application/json", "{\"status\":\"success\"}");
         });
 
@@ -518,7 +600,7 @@
         });
 
         server.begin();
-        Serial.println("[HTTP] Server cục bộ chạy tại Port 80");
+        Serial.println("Máy chủ cục bộ chạy tại cổng 80");
     }
 
     // ============================================================
@@ -534,12 +616,12 @@
             json.get(result, "rfid");     if (result.success) strncpy(cmd.rfid, result.stringValue.c_str(), 19);
             json.get(result, "name");     if (result.success) strncpy(cmd.name, result.stringValue.c_str(), 49);
             xQueueSend(cmdQueue, &cmd, 0);
-            Serial.println("[FIREBASE WEB] Lệnh từ giao diện: " + String(cmd.command));
+            Serial.println("Lệnh từ giao diện Web: " + String(cmd.command));
         }
     }
 
     void streamTimeoutCallback(bool timeout) {
-        if (timeout) Serial.println("[FIREBASE] Stream timeout, đang kết nối lại...");
+        if (timeout) Serial.println("Mất kết nối luồng Firebase, đang kết nối lại...");
     }
 
     // ============================================================
@@ -548,7 +630,7 @@
     void setup() {
         delay(1000);
         Serial.begin(115200);
-        Serial.println("\n[SYSTEM] Hệ thống đang khởi động...");
+        Serial.println("Hệ thống đang khởi động...");
 
         SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, -1);
         tft.begin(); tft.setRotation(3); tft.fillScreen(ILI9341_BLACK);
@@ -567,10 +649,10 @@
 
         prefs.begin("robot_data", false);
 
-        Serial.println("[WiFi] Đang kết nối...");
+        Serial.println("Đang kết nối WiFi...");
         WiFi.begin(ssid, password);
         while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-        Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("\nĐã kết nối WiFi, IP: %s\n", WiFi.localIP().toString().c_str());
 
         configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
 
@@ -586,7 +668,7 @@
 
         if (Firebase.RTDB.beginStream(&fbdo_stream, "/RobotLeTan/Control")) {
             Firebase.RTDB.setStreamCallback(&fbdo_stream, streamCallback, streamTimeoutCallback);
-            Serial.println("[FIREBASE] Stream lắng nghe Web đã bật.");
+            Serial.println("Đã bật luồng lắng nghe lệnh từ Web.");
         }
 
         refreshAdminStatus(true);
@@ -600,7 +682,7 @@
         xTaskCreatePinnedToCore(TaskSensorsCode,  "TaskSensors",  16000, NULL, 1, &TaskSensorsHandle,  1);
         xTaskCreatePinnedToCore(TaskFirebaseCode, "TaskFirebase",  8000, NULL, 1, &TaskFirebaseHandle,  0);
 
-        Serial.println("[SYSTEM] Khởi động đa nhân hoàn tất.");
+        Serial.println("Khởi động đa nhân hoàn tất.");
     }
 
     void loop() {
@@ -608,15 +690,15 @@
     }
 
     // ============================================================
-    //  DISPLAY
+    //  HIỂN THỊ MÀN HÌNH
     // ============================================================
     void triggerEmotion(int type, String msg, String speechText) {
-        isWaiting = false;
+        isWaiting = false; lastActionTime = millis();
         tft.fillScreen(ILI9341_BLACK);
-        tft.setCursor(10, 5);  tft.setTextColor(ILI9341_WHITE); tft.setTextSize(1); tft.print(currentSysDate);
+        tft.setCursor(10, 5); tft.setTextColor(ILI9341_WHITE); tft.setTextSize(1); tft.print(currentSysDate);
         tft.fillRect(0, 20, 320, 40, ILI9341_DARKGREY);
         tft.setCursor(10, 32); tft.setTextColor(ILI9341_WHITE); tft.setTextSize(2); tft.print(removeAccents(msg));
-        speakText(speechText);
+        if (speechText.length() > 0) speakText(speechText);  // ← chỉ nói khi có text
         if      (type == 1) drawHappyEyes();
         else if (type == 2) drawAngryEyes();
         else                drawInfoEyes();
