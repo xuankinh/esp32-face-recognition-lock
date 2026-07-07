@@ -1,0 +1,23 @@
+# Model files (quá nặng để commit)
+models/*.onnx
+models/*.task
+models/*.npz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Log
+*.log
